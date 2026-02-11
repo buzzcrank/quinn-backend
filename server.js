@@ -25,11 +25,32 @@ const pool = new Pool({
   },
 });
 
-// Test DB connection on startup
+// Initialize database
+async function initializeDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        email TEXT,
+        phone TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    console.log("✅ Users table ready.");
+  } catch (err) {
+    console.error("❌ Error initializing database:", err);
+    process.exit(1);
+  }
+}
+
+// Test connection and initialize
 pool.connect()
   .then(client => {
     console.log("✅ Connected to PostgreSQL database.");
     client.release();
+    return initializeDatabase();
   })
   .catch(err => {
     console.error("❌ Database connection failed:", err);
@@ -48,14 +69,33 @@ app.get("/", (req, res) => {
 });
 
 // Onboarding webhook endpoint
-app.post("/webhooks/onboarding", (req, res) => {
+app.post("/webhooks/onboarding", async (req, res) => {
   console.log("📥 Onboarding webhook received:");
   console.log(JSON.stringify(req.body, null, 2));
 
-  res.status(200).json({
-    status: "success",
-    message: "Onboarding data received."
-  });
+  try {
+    const { name, email, phone } = req.body;
+
+    await pool.query(
+      "INSERT INTO users (name, email, phone) VALUES ($1, $2, $3)",
+      [name, email, phone]
+    );
+
+    console.log("✅ User saved to database.");
+
+    res.status(200).json({
+      status: "success",
+      message: "Onboarding data saved."
+    });
+
+  } catch (err) {
+    console.error("❌ Error saving user:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to save onboarding data."
+    });
+  }
 });
 
 app.listen(PORT, () => {
