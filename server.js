@@ -1,10 +1,46 @@
 // server.js
 const express = require("express");
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+
+/*
+====================================
+DATABASE CONNECTION
+====================================
+*/
+
+if (!process.env.DATABASE_URL) {
+  console.error("❌ DATABASE_URL not found in environment variables.");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
+
+// Test DB connection on startup
+pool.connect()
+  .then(client => {
+    console.log("✅ Connected to PostgreSQL database.");
+    client.release();
+  })
+  .catch(err => {
+    console.error("❌ Database connection failed:", err);
+    process.exit(1);
+  });
+
+/*
+====================================
+ROUTES
+====================================
+*/
 
 // Health check route
 app.get("/", (req, res) => {
