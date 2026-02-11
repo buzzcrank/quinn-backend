@@ -28,17 +28,22 @@ const pool = new Pool({
 // Initialize database
 async function initializeDatabase() {
   try {
+    // Drop old table (safe for MVP stage)
+    await pool.query(`DROP TABLE IF EXISTS users;`);
+
+    // Recreate with correct schema
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
+      CREATE TABLE users (
         id SERIAL PRIMARY KEY,
-        name TEXT,
+        full_name TEXT,
         email TEXT,
-        phone TEXT,
+        real_phone TEXT,
+        consent BOOLEAN,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
-    console.log("✅ Users table ready.");
+    console.log("✅ Users table reset with correct schema.");
   } catch (err) {
     console.error("❌ Error initializing database:", err);
     process.exit(1);
@@ -74,11 +79,11 @@ app.post("/webhooks/onboarding", async (req, res) => {
   console.log(JSON.stringify(req.body, null, 2));
 
   try {
-    const { name, email, phone } = req.body;
+    const { full_name, email, real_phone, consent } = req.body;
 
     await pool.query(
-      "INSERT INTO users (name, email, phone) VALUES ($1, $2, $3)",
-      [name, email, phone]
+      "INSERT INTO users (full_name, email, real_phone, consent) VALUES ($1, $2, $3, $4)",
+      [full_name, email, real_phone, consent]
     );
 
     console.log("✅ User saved to database.");
