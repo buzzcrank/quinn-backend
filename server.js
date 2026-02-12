@@ -27,6 +27,7 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
+    // Create table if it does not exist
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -36,12 +37,27 @@ async function initializeDatabase() {
         status TEXT DEFAULT 'new',
         verified BOOLEAN DEFAULT FALSE,
         verified_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
-    console.log("✅ Users table ready.");
+    // Ensure new columns exist (safe migrations)
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP;
+    `);
+
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'caller';
+    `);
+
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new';
+    `);
+
+    console.log("✅ Users table ready with lifecycle + fast lane support.");
   } catch (err) {
     console.error("❌ Error initializing DB:", err);
     process.exit(1);
@@ -124,10 +140,7 @@ CHECK USER STATUS (FAST LANE)
 app.post("/check-user-status", async (req, res) => {
   try {
     const { phone } = req.body;
-
-    if (!phone) {
-      return res.status(400).json({ error: "Phone required." });
-    }
+    if (!phone) return res.status(400).json({ error: "Phone required." });
 
     const formattedPhone = normalizePhone(phone);
 
@@ -175,10 +188,7 @@ START VERIFICATION
 app.post("/start-verification", async (req, res) => {
   try {
     const { name, phone } = req.body;
-
-    if (!phone) {
-      return res.status(400).json({ error: "Phone number required." });
-    }
+    if (!phone) return res.status(400).json({ error: "Phone required." });
 
     const formattedPhone = normalizePhone(phone);
 
@@ -208,9 +218,7 @@ app.post("/start-verification", async (req, res) => {
 
     console.log("✅ Twilio SID:", verification.sid);
 
-    res.status(200).json({
-      status: "success"
-    });
+    res.status(200).json({ status: "success" });
 
   } catch (err) {
     console.error("❌ Start verification error:", err);
@@ -227,7 +235,6 @@ VERIFY OTP
 app.post("/verify", async (req, res) => {
   try {
     const { phone, code } = req.body;
-
     if (!phone || !code) {
       return res.status(400).json({ error: "Phone and code required." });
     }
@@ -260,14 +267,10 @@ app.post("/verify", async (req, res) => {
         WHERE phone = $1
       `, [formattedPhone]);
 
-      return res.status(200).json({
-        status: "approved"
-      });
+      return res.status(200).json({ status: "approved" });
 
     } else {
-      return res.status(400).json({
-        status: "pending"
-      });
+      return res.status(400).json({ status: "pending" });
     }
 
   } catch (err) {
