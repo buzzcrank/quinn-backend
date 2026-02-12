@@ -27,7 +27,6 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
-    // IMPORTANT: DO NOT DROP TABLE ANYMORE
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -62,6 +61,24 @@ pool.connect()
 
 /*
 ====================================
+PHONE NORMALIZATION
+====================================
+*/
+
+function normalizePhone(phone) {
+  if (!phone) throw new Error("Phone number required.");
+
+  const digits = phone.replace(/\D/g, "");
+
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (phone.startsWith("+") && digits.length >= 11) return phone;
+
+  throw new Error("Invalid phone format. Must be valid US number.");
+}
+
+/*
+====================================
 TWILIO VERIFY CLIENT
 ====================================
 */
@@ -90,39 +107,21 @@ function getTwilioClient() {
 
 /*
 ====================================
-PHONE NORMALIZATION
-====================================
-*/
-
-function normalizePhone(phone) {
-  if (!phone) throw new Error("Phone number required.");
-
-  const digits = phone.replace(/\D/g, "");
-
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
-  if (phone.startsWith("+") && digits.length >= 11) return phone;
-
-  throw new Error("Invalid phone format. Must be valid US number.");
-}
-
-/*
-====================================
-ROUTES
+ROOT
 ====================================
 */
 
 app.get("/", (req, res) => {
-  res.status(200).send("Quinn backend running.");
+  res.status(200).send("Quinn backend running with Fast Lane support.");
 });
 
 /*
 ====================================
-CHECK USER (FAST LANE)
+CHECK USER STATUS (FAST LANE)
 ====================================
 */
 
-app.post("/check-user", async (req, res) => {
+app.post("/check-user-status", async (req, res) => {
   try {
     const { phone } = req.body;
 
@@ -133,13 +132,14 @@ app.post("/check-user", async (req, res) => {
     const formattedPhone = normalizePhone(phone);
 
     const result = await pool.query(
-      `SELECT name, verified FROM users WHERE phone = $1`,
+      `SELECT name, verified, role, status FROM users WHERE phone = $1`,
       [formattedPhone]
     );
 
     if (result.rows.length === 0) {
       return res.status(200).json({
-        exists: false
+        exists: false,
+        verified: false
       });
     }
 
@@ -150,22 +150,18 @@ app.post("/check-user", async (req, res) => {
         `UPDATE users SET last_seen = NOW() WHERE phone = $1`,
         [formattedPhone]
       );
-
-      return res.status(200).json({
-        exists: true,
-        verified: true,
-        name: user.name
-      });
     }
 
     return res.status(200).json({
       exists: true,
-      verified: false,
-      name: user.name
+      verified: user.verified,
+      name: user.name,
+      role: user.role,
+      status: user.status
     });
 
   } catch (err) {
-    console.error("❌ Check user error:", err);
+    console.error("❌ check-user-status error:", err);
     res.status(400).json({ error: err.message });
   }
 });
@@ -180,28 +176,26 @@ app.post("/start-verification", async (req, res) => {
   try {
     const { name, phone } = req.body;
 
-    console.log("📥 Raw phone received:", phone);
-
     if (!phone) {
       return res.status(400).json({ error: "Phone number required." });
     }
 
     const formattedPhone = normalizePhone(phone);
 
-    console.log("📲 Sending verification to:", formattedPhone);
-
     const client = getTwilioClient();
     if (!client) {
       return res.status(500).json({ error: "Twilio Verify not configured." });
     }
 
+    console.log("📲 Sending verification to:", formattedPhone);
+
     await pool.query(`
       INSERT INTO users (name, phone, role, status, verified)
-      VALUES ($1, $2, 'caller', 'new', false)
+      VALUES ($1, $2, 'caller', 'pending_verification', false)
       ON CONFLICT (phone)
       DO UPDATE SET
         name = EXCLUDED.name,
-        status = 'new',
+        status = 'pending_verification',
         verified = false;
     `, [name || null, formattedPhone]);
 
@@ -261,6 +255,7 @@ app.post("/verify", async (req, res) => {
         SET verified = true,
             verified_at = NOW(),
             status = 'verified',
+            role = 'customer',
             last_seen = NOW()
         WHERE phone = $1
       `, [formattedPhone]);
