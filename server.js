@@ -91,6 +91,35 @@ function getTwilioClient() {
 
 /*
 ====================================
+PHONE NORMALIZATION
+====================================
+*/
+
+function normalizePhone(phone) {
+  if (!phone) throw new Error("Phone number required.");
+
+  const digits = phone.replace(/\D/g, "");
+
+  // US 10-digit number
+  if (digits.length === 10) {
+    return `+1${digits}`;
+  }
+
+  // US 11-digit starting with 1
+  if (digits.length === 11 && digits.startsWith("1")) {
+    return `+${digits}`;
+  }
+
+  // Already E.164
+  if (phone.startsWith("+") && digits.length >= 11) {
+    return phone;
+  }
+
+  throw new Error("Invalid phone format. Must include valid US number.");
+}
+
+/*
+====================================
 ROUTES
 ====================================
 */
@@ -113,6 +142,8 @@ app.post("/start-verification", async (req, res) => {
       return res.status(400).json({ error: "Phone number required." });
     }
 
+    const formattedPhone = normalizePhone(phone);
+
     const client = getTwilioClient();
     if (!client) {
       return res.status(500).json({ error: "Twilio Verify not configured." });
@@ -127,13 +158,13 @@ app.post("/start-verification", async (req, res) => {
         name = EXCLUDED.name,
         status = 'new',
         verified = false;
-    `, [name || null, phone]);
+    `, [name || null, formattedPhone]);
 
-    // Send OTP via Twilio Verify
+    // Send OTP
     await client.verify.v2
       .services(process.env.TWILIO_VERIFY_SERVICE_SID)
       .verifications.create({
-        to: phone,
+        to: formattedPhone,
         channel: "sms"
       });
 
@@ -143,8 +174,8 @@ app.post("/start-verification", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Start verification error:", err);
-    res.status(500).json({ error: "Failed to start verification." });
+    console.error("❌ Start verification error:", err.message);
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -162,6 +193,8 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ error: "Phone and code required." });
     }
 
+    const formattedPhone = normalizePhone(phone);
+
     const client = getTwilioClient();
     if (!client) {
       return res.status(500).json({ error: "Twilio Verify not configured." });
@@ -170,7 +203,7 @@ app.post("/verify", async (req, res) => {
     const verificationCheck = await client.verify.v2
       .services(process.env.TWILIO_VERIFY_SERVICE_SID)
       .verificationChecks.create({
-        to: phone,
+        to: formattedPhone,
         code: code
       });
 
@@ -183,7 +216,7 @@ app.post("/verify", async (req, res) => {
           verified_at = NOW(),
           status = 'verified'
         WHERE phone = $1
-      `, [phone]);
+      `, [formattedPhone]);
 
       return res.status(200).json({
         status: "approved",
@@ -198,8 +231,8 @@ app.post("/verify", async (req, res) => {
     }
 
   } catch (err) {
-    console.error("❌ Verify error:", err);
-    res.status(500).json({ error: "Verification failed." });
+    console.error("❌ Verify error:", err.message);
+    res.status(400).json({ error: err.message });
   }
 });
 
