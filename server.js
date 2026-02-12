@@ -27,7 +27,7 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
-    // TEMPORARY RESET FOR SPRINT 2
+    // TEMP RESET FOR SPRINT 2
     await pool.query(`DROP TABLE IF EXISTS users;`);
 
     await pool.query(`
@@ -36,8 +36,6 @@ async function initializeDatabase() {
         name TEXT,
         phone TEXT UNIQUE NOT NULL,
         verified BOOLEAN DEFAULT FALSE,
-        verification_code TEXT,
-        code_expires_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
@@ -62,17 +60,19 @@ pool.connect()
 
 /*
 ====================================
-TWILIO CLIENT
+TWILIO VERIFY CLIENT
 ====================================
 */
 
 let twilioClient = null;
 
 function getTwilioClient() {
-  if (!process.env.TWILIO_ACCOUNT_SID ||
-      !process.env.TWILIO_AUTH_TOKEN ||
-      !process.env.TWILIO_PHONE_NUMBER) {
-    console.error("❌ Twilio environment variables missing.");
+  if (
+    !process.env.TWILIO_ACCOUNT_SID ||
+    !process.env.TWILIO_AUTH_TOKEN ||
+    !process.env.TWILIO_VERIFY_SERVICE_SID
+  ) {
+    console.error("❌ Twilio Verify environment variables missing.");
     return null;
   }
 
@@ -88,29 +88,19 @@ function getTwilioClient() {
 
 /*
 ====================================
-UTILITY FUNCTIONS
-====================================
-*/
-
-function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-function codeExpiration() {
-  const expires = new Date();
-  expires.setMinutes(expires.getMinutes() + 10);
-  return expires;
-}
-
-/*
-====================================
 ROUTES
 ====================================
 */
 
 app.get("/", (req, res) => {
-  res.status(200).send("Quinn backend running.");
+  res.status(200).send("Quinn backend running with Twilio Verify.");
 });
+
+/*
+====================================
+START VERIFICATION (SEND OTP)
+====================================
+*/
 
 app.post("/start-verification", async (req, res) => {
   try {
@@ -120,30 +110,28 @@ app.post("/start-verification", async (req, res) => {
       return res.status(400).json({ error: "Phone number required." });
     }
 
-    const code = generateCode();
-    const expires = codeExpiration();
+    const client = getTwilioClient();
+    if (!client) {
+      return res.status(500).json({ error: "Twilio Verify not configured." });
+    }
 
+    // Save or update user
     await pool.query(`
-      INSERT INTO users (name, phone, verification_code, code_expires_at, verified)
-      VALUES ($1, $2, $3, $4, false)
+      INSERT INTO users (name, phone, verified)
+      VALUES ($1, $2, false)
       ON CONFLICT (phone)
       DO UPDATE SET
         name = EXCLUDED.name,
-        verification_code = EXCLUDED.verification_code,
-        code_expires_at = EXCLUDED.code_expires_at,
         verified = false;
-    `, [name || null, phone, code, expires]);
+    `, [name || null, phone]);
 
-    const client = getTwilioClient();
-    if (!client) {
-      return res.status(500).json({ error: "Twilio not configured." });
-    }
-
-    await client.messages.create({
-      body: `Your Quinn verification code is ${code}`,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: phone
-    });
+    // Send OTP via Twilio Verify
+    await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verifications.create({
+        to: phone,
+        channel: "sms"
+      });
 
     res.status(200).json({
       status: "success",
@@ -156,6 +144,12 @@ app.post("/start-verification", async (req, res) => {
   }
 });
 
+/*
+====================================
+CHECK VERIFICATION CODE
+====================================
+*/
+
 app.post("/verify", async (req, res) => {
   try {
     const { phone, code } = req.body;
@@ -164,34 +158,36 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ error: "Phone and code required." });
     }
 
-    const result = await pool.query(
-      "SELECT * FROM users WHERE phone = $1",
-      [phone]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "User not found." });
+    const client = getTwilioClient();
+    if (!client) {
+      return res.status(500).json({ error: "Twilio Verify not configured." });
     }
 
-    const user = result.rows[0];
+    const verificationCheck = await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verificationChecks.create({
+        to: phone,
+        code: code
+      });
 
-    if (user.verification_code !== code) {
-      return res.status(400).json({ error: "Invalid code." });
+    if (verificationCheck.status === "approved") {
+
+      await pool.query(
+        "UPDATE users SET verified = true WHERE phone = $1",
+        [phone]
+      );
+
+      return res.status(200).json({
+        status: "approved",
+        message: "Phone verified."
+      });
+
+    } else {
+      return res.status(400).json({
+        status: "pending",
+        message: "Invalid or expired code."
+      });
     }
-
-    if (new Date() > user.code_expires_at) {
-      return res.status(400).json({ error: "Code expired." });
-    }
-
-    await pool.query(
-      "UPDATE users SET verified = true WHERE phone = $1",
-      [phone]
-    );
-
-    res.status(200).json({
-      status: "success",
-      message: "Phone verified."
-    });
 
   } catch (err) {
     console.error("❌ Verify error:", err);
