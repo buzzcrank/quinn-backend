@@ -27,8 +27,11 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
+    // TEMPORARY RESET FOR SPRINT 2
+    await pool.query(`DROP TABLE IF EXISTS users;`);
+
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
+      CREATE TABLE users (
         id SERIAL PRIMARY KEY,
         name TEXT,
         phone TEXT UNIQUE NOT NULL,
@@ -39,7 +42,7 @@ async function initializeDatabase() {
       );
     `);
 
-    console.log("✅ Users table ready.");
+    console.log("✅ Users table RESET for Sprint 2.");
   } catch (err) {
     console.error("❌ Error initializing DB:", err);
     process.exit(1);
@@ -59,7 +62,7 @@ pool.connect()
 
 /*
 ====================================
-TWILIO CLIENT (SAFE INIT)
+TWILIO CLIENT
 ====================================
 */
 
@@ -69,7 +72,7 @@ function getTwilioClient() {
   if (!process.env.TWILIO_ACCOUNT_SID ||
       !process.env.TWILIO_AUTH_TOKEN ||
       !process.env.TWILIO_PHONE_NUMBER) {
-    console.error("❌ Twilio environment variables missing at runtime.");
+    console.error("❌ Twilio environment variables missing.");
     return null;
   }
 
@@ -108,12 +111,6 @@ ROUTES
 app.get("/", (req, res) => {
   res.status(200).send("Quinn backend running.");
 });
-
-/*
-------------------------------------
-START VERIFICATION
-------------------------------------
-*/
 
 app.post("/start-verification", async (req, res) => {
   try {
@@ -158,12 +155,6 @@ app.post("/start-verification", async (req, res) => {
     res.status(500).json({ error: "Failed to start verification." });
   }
 });
-
-/*
-------------------------------------
-VERIFY CODE
-------------------------------------
-*/
 
 app.post("/verify", async (req, res) => {
   try {
