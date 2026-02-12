@@ -27,10 +27,9 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
-    await pool.query(`DROP TABLE IF EXISTS users;`);
-
+    // IMPORTANT: DO NOT DROP TABLE ANYMORE
     await pool.query(`
-      CREATE TABLE users (
+      CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         name TEXT,
         phone TEXT UNIQUE NOT NULL,
@@ -38,11 +37,12 @@ async function initializeDatabase() {
         status TEXT DEFAULT 'new',
         verified BOOLEAN DEFAULT FALSE,
         verified_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP
       );
     `);
 
-    console.log("✅ Users table RESET with lifecycle schema.");
+    console.log("✅ Users table ready.");
   } catch (err) {
     console.error("❌ Error initializing DB:", err);
     process.exit(1);
@@ -99,17 +99,9 @@ function normalizePhone(phone) {
 
   const digits = phone.replace(/\D/g, "");
 
-  if (digits.length === 10) {
-    return `+1${digits}`;
-  }
-
-  if (digits.length === 11 && digits.startsWith("1")) {
-    return `+${digits}`;
-  }
-
-  if (phone.startsWith("+") && digits.length >= 11) {
-    return phone;
-  }
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (phone.startsWith("+") && digits.length >= 11) return phone;
 
   throw new Error("Invalid phone format. Must be valid US number.");
 }
@@ -121,7 +113,61 @@ ROUTES
 */
 
 app.get("/", (req, res) => {
-  res.status(200).send("Quinn backend running with lifecycle schema.");
+  res.status(200).send("Quinn backend running.");
+});
+
+/*
+====================================
+CHECK USER (FAST LANE)
+====================================
+*/
+
+app.post("/check-user", async (req, res) => {
+  try {
+    const { phone } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ error: "Phone required." });
+    }
+
+    const formattedPhone = normalizePhone(phone);
+
+    const result = await pool.query(
+      `SELECT name, verified FROM users WHERE phone = $1`,
+      [formattedPhone]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(200).json({
+        exists: false
+      });
+    }
+
+    const user = result.rows[0];
+
+    if (user.verified) {
+      await pool.query(
+        `UPDATE users SET last_seen = NOW() WHERE phone = $1`,
+        [formattedPhone]
+      );
+
+      return res.status(200).json({
+        exists: true,
+        verified: true,
+        name: user.name
+      });
+    }
+
+    return res.status(200).json({
+      exists: true,
+      verified: false,
+      name: user.name
+    });
+
+  } catch (err) {
+    console.error("❌ Check user error:", err);
+    res.status(400).json({ error: err.message });
+  }
 });
 
 /*
@@ -134,7 +180,7 @@ app.post("/start-verification", async (req, res) => {
   try {
     const { name, phone } = req.body;
 
-    console.log("📥 Raw phone received from VAPI:", phone);
+    console.log("📥 Raw phone received:", phone);
 
     if (!phone) {
       return res.status(400).json({ error: "Phone number required." });
@@ -166,11 +212,10 @@ app.post("/start-verification", async (req, res) => {
         channel: "sms"
       });
 
-    console.log("✅ Twilio Verify SID:", verification.sid);
+    console.log("✅ Twilio SID:", verification.sid);
 
     res.status(200).json({
-      status: "success",
-      message: "Verification code sent."
+      status: "success"
     });
 
   } catch (err) {
@@ -188,8 +233,6 @@ VERIFY OTP
 app.post("/verify", async (req, res) => {
   try {
     const { phone, code } = req.body;
-
-    console.log("📥 Verify attempt for:", phone, "with code:", code);
 
     if (!phone || !code) {
       return res.status(400).json({ error: "Phone and code required." });
@@ -215,22 +258,20 @@ app.post("/verify", async (req, res) => {
 
       await pool.query(`
         UPDATE users
-        SET
-          verified = true,
-          verified_at = NOW(),
-          status = 'verified'
+        SET verified = true,
+            verified_at = NOW(),
+            status = 'verified',
+            last_seen = NOW()
         WHERE phone = $1
       `, [formattedPhone]);
 
       return res.status(200).json({
-        status: "approved",
-        message: "Phone verified."
+        status: "approved"
       });
 
     } else {
       return res.status(400).json({
-        status: "pending",
-        message: "Invalid or expired code."
+        status: "pending"
       });
     }
 
