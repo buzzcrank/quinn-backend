@@ -11,7 +11,7 @@ app.use(express.json());
 
 /*
 ====================================
-ENVIRONMENT VALIDATION
+DATABASE CONNECTION
 ====================================
 */
 
@@ -19,19 +19,6 @@ if (!process.env.DATABASE_URL) {
   console.error("❌ DATABASE_URL not found.");
   process.exit(1);
 }
-
-if (!process.env.TWILIO_ACCOUNT_SID ||
-    !process.env.TWILIO_AUTH_TOKEN ||
-    !process.env.TWILIO_PHONE_NUMBER) {
-  console.error("❌ Twilio environment variables missing.");
-  process.exit(1);
-}
-
-/*
-====================================
-DATABASE CONNECTION
-====================================
-*/
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -72,14 +59,29 @@ pool.connect()
 
 /*
 ====================================
-TWILIO CLIENT
+TWILIO CLIENT (SAFE INIT)
 ====================================
 */
 
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+let twilioClient = null;
+
+function getTwilioClient() {
+  if (!process.env.TWILIO_ACCOUNT_SID ||
+      !process.env.TWILIO_AUTH_TOKEN ||
+      !process.env.TWILIO_PHONE_NUMBER) {
+    console.error("❌ Twilio environment variables missing at runtime.");
+    return null;
+  }
+
+  if (!twilioClient) {
+    twilioClient = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN
+    );
+  }
+
+  return twilioClient;
+}
 
 /*
 ====================================
@@ -103,7 +105,6 @@ ROUTES
 ====================================
 */
 
-// Health Check
 app.get("/", (req, res) => {
   res.status(200).send("Quinn backend running.");
 });
@@ -111,7 +112,6 @@ app.get("/", (req, res) => {
 /*
 ------------------------------------
 START VERIFICATION
-Creates or updates caller profile
 ------------------------------------
 */
 
@@ -135,9 +135,14 @@ app.post("/start-verification", async (req, res) => {
         verification_code = EXCLUDED.verification_code,
         code_expires_at = EXCLUDED.code_expires_at,
         verified = false;
-    `, [name, phone, code, expires]);
+    `, [name || null, phone, code, expires]);
 
-    await twilioClient.messages.create({
+    const client = getTwilioClient();
+    if (!client) {
+      return res.status(500).json({ error: "Twilio not configured." });
+    }
+
+    await client.messages.create({
       body: `Your Quinn verification code is ${code}`,
       from: process.env.TWILIO_PHONE_NUMBER,
       to: phone
@@ -157,7 +162,6 @@ app.post("/start-verification", async (req, res) => {
 /*
 ------------------------------------
 VERIFY CODE
-Used by Web OR Voice
 ------------------------------------
 */
 
