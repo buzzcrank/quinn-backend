@@ -27,7 +27,7 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
-    // TEMP RESET FOR SPRINT 2
+    // SAFE TO RESET (PRE-PRODUCTION)
     await pool.query(`DROP TABLE IF EXISTS users;`);
 
     await pool.query(`
@@ -35,12 +35,15 @@ async function initializeDatabase() {
         id SERIAL PRIMARY KEY,
         name TEXT,
         phone TEXT UNIQUE NOT NULL,
+        role TEXT DEFAULT 'caller',
+        status TEXT DEFAULT 'new',
         verified BOOLEAN DEFAULT FALSE,
+        verified_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
-    console.log("✅ Users table RESET for Sprint 2.");
+    console.log("✅ Users table RESET with lifecycle schema.");
   } catch (err) {
     console.error("❌ Error initializing DB:", err);
     process.exit(1);
@@ -93,7 +96,7 @@ ROUTES
 */
 
 app.get("/", (req, res) => {
-  res.status(200).send("Quinn backend running with Twilio Verify.");
+  res.status(200).send("Quinn backend running with lifecycle schema.");
 });
 
 /*
@@ -115,13 +118,14 @@ app.post("/start-verification", async (req, res) => {
       return res.status(500).json({ error: "Twilio Verify not configured." });
     }
 
-    // Save or update user
+    // Create or update caller record
     await pool.query(`
-      INSERT INTO users (name, phone, verified)
-      VALUES ($1, $2, false)
+      INSERT INTO users (name, phone, role, status, verified)
+      VALUES ($1, $2, 'caller', 'new', false)
       ON CONFLICT (phone)
       DO UPDATE SET
         name = EXCLUDED.name,
+        status = 'new',
         verified = false;
     `, [name || null, phone]);
 
@@ -146,7 +150,7 @@ app.post("/start-verification", async (req, res) => {
 
 /*
 ====================================
-CHECK VERIFICATION CODE
+VERIFY OTP
 ====================================
 */
 
@@ -172,10 +176,14 @@ app.post("/verify", async (req, res) => {
 
     if (verificationCheck.status === "approved") {
 
-      await pool.query(
-        "UPDATE users SET verified = true WHERE phone = $1",
-        [phone]
-      );
+      await pool.query(`
+        UPDATE users
+        SET
+          verified = true,
+          verified_at = NOW(),
+          status = 'verified'
+        WHERE phone = $1
+      `, [phone]);
 
       return res.status(200).json({
         status: "approved",
