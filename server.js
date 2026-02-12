@@ -8,6 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 /*
 ====================================
@@ -27,7 +28,6 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
-    // Create table if it does not exist
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -37,27 +37,12 @@ async function initializeDatabase() {
         status TEXT DEFAULT 'new',
         verified BOOLEAN DEFAULT FALSE,
         verified_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP
       );
     `);
 
-    // Ensure new columns exist (safe migrations)
-    await pool.query(`
-      ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP;
-    `);
-
-    await pool.query(`
-      ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'caller';
-    `);
-
-    await pool.query(`
-      ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new';
-    `);
-
-    console.log("✅ Users table ready with lifecycle + fast lane support.");
+    console.log("✅ Users table ready with Caller ID + Fast Lane support.");
   } catch (err) {
     console.error("❌ Error initializing DB:", err);
     process.exit(1);
@@ -90,7 +75,7 @@ function normalizePhone(phone) {
   if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
   if (phone.startsWith("+") && digits.length >= 11) return phone;
 
-  throw new Error("Invalid phone format. Must be valid US number.");
+  throw new Error("Invalid phone format.");
 }
 
 /*
@@ -128,12 +113,64 @@ ROOT
 */
 
 app.get("/", (req, res) => {
-  res.status(200).send("Quinn backend running with Fast Lane support.");
+  res.status(200).send("Quinn backend running with Caller ID Fast Lane.");
 });
 
 /*
 ====================================
-CHECK USER STATUS (FAST LANE)
+VOICE WEBHOOK (CALLER ID AUTO-DETECT)
+====================================
+*/
+
+app.post("/voice-webhook", async (req, res) => {
+  try {
+    const callerIdRaw = req.body.From;
+    if (!callerIdRaw) {
+      return res.status(400).json({ error: "Caller ID missing." });
+    }
+
+    const callerId = normalizePhone(callerIdRaw);
+
+    console.log("📞 Incoming call from:", callerId);
+
+    const result = await pool.query(
+      `SELECT name, verified FROM users WHERE phone = $1`,
+      [callerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(200).json({
+        exists: false,
+        verified: false,
+        phone: callerId
+      });
+    }
+
+    const user = result.rows[0];
+
+    if (user.verified) {
+      await pool.query(
+        `UPDATE users SET last_seen = NOW() WHERE phone = $1`,
+        [callerId]
+      );
+    }
+
+    return res.status(200).json({
+      exists: true,
+      verified: user.verified,
+      name: user.name,
+      phone: callerId
+    });
+
+  } catch (err) {
+    console.error("❌ voice-webhook error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/*
+====================================
+CHECK USER STATUS (WEB FAST LANE)
 ====================================
 */
 
@@ -209,14 +246,12 @@ app.post("/start-verification", async (req, res) => {
         verified = false;
     `, [name || null, formattedPhone]);
 
-    const verification = await client.verify.v2
+    await client.verify.v2
       .services(process.env.TWILIO_VERIFY_SERVICE_SID)
       .verifications.create({
         to: formattedPhone,
         channel: "sms"
       });
-
-    console.log("✅ Twilio SID:", verification.sid);
 
     res.status(200).json({ status: "success" });
 
