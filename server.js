@@ -27,7 +27,6 @@ const pool = new Pool({
 
 async function initializeDatabase() {
   try {
-    // SAFE TO RESET (PRE-PRODUCTION)
     await pool.query(`DROP TABLE IF EXISTS users;`);
 
     await pool.query(`
@@ -100,22 +99,19 @@ function normalizePhone(phone) {
 
   const digits = phone.replace(/\D/g, "");
 
-  // US 10-digit number
   if (digits.length === 10) {
     return `+1${digits}`;
   }
 
-  // US 11-digit starting with 1
   if (digits.length === 11 && digits.startsWith("1")) {
     return `+${digits}`;
   }
 
-  // Already E.164
   if (phone.startsWith("+") && digits.length >= 11) {
     return phone;
   }
 
-  throw new Error("Invalid phone format. Must include valid US number.");
+  throw new Error("Invalid phone format. Must be valid US number.");
 }
 
 /*
@@ -130,7 +126,7 @@ app.get("/", (req, res) => {
 
 /*
 ====================================
-START VERIFICATION (SEND OTP)
+START VERIFICATION
 ====================================
 */
 
@@ -138,18 +134,21 @@ app.post("/start-verification", async (req, res) => {
   try {
     const { name, phone } = req.body;
 
+    console.log("📥 Raw phone received from VAPI:", phone);
+
     if (!phone) {
       return res.status(400).json({ error: "Phone number required." });
     }
 
     const formattedPhone = normalizePhone(phone);
 
+    console.log("📲 Sending verification to:", formattedPhone);
+
     const client = getTwilioClient();
     if (!client) {
       return res.status(500).json({ error: "Twilio Verify not configured." });
     }
 
-    // Create or update caller record
     await pool.query(`
       INSERT INTO users (name, phone, role, status, verified)
       VALUES ($1, $2, 'caller', 'new', false)
@@ -160,13 +159,14 @@ app.post("/start-verification", async (req, res) => {
         verified = false;
     `, [name || null, formattedPhone]);
 
-    // Send OTP
-    await client.verify.v2
+    const verification = await client.verify.v2
       .services(process.env.TWILIO_VERIFY_SERVICE_SID)
       .verifications.create({
         to: formattedPhone,
         channel: "sms"
       });
+
+    console.log("✅ Twilio Verify SID:", verification.sid);
 
     res.status(200).json({
       status: "success",
@@ -174,7 +174,7 @@ app.post("/start-verification", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Start verification error:", err.message);
+    console.error("❌ Start verification error:", err);
     res.status(400).json({ error: err.message });
   }
 });
@@ -188,6 +188,8 @@ VERIFY OTP
 app.post("/verify", async (req, res) => {
   try {
     const { phone, code } = req.body;
+
+    console.log("📥 Verify attempt for:", phone, "with code:", code);
 
     if (!phone || !code) {
       return res.status(400).json({ error: "Phone and code required." });
@@ -206,6 +208,8 @@ app.post("/verify", async (req, res) => {
         to: formattedPhone,
         code: code
       });
+
+    console.log("🔎 Verification status:", verificationCheck.status);
 
     if (verificationCheck.status === "approved") {
 
@@ -231,7 +235,7 @@ app.post("/verify", async (req, res) => {
     }
 
   } catch (err) {
-    console.error("❌ Verify error:", err.message);
+    console.error("❌ Verify error:", err);
     res.status(400).json({ error: err.message });
   }
 });
