@@ -14,10 +14,7 @@ BODY PARSING
 ====================================
 */
 
-// Stripe webhook must receive raw body
 app.use("/stripe-webhook", express.raw({ type: "application/json" }));
-
-// Everything else uses JSON
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
@@ -78,16 +75,6 @@ STRIPE INIT
 ====================================
 */
 
-if (!process.env.STRIPE_SECRET_KEY) {
-  console.error("❌ STRIPE_SECRET_KEY missing.");
-  process.exit(1);
-}
-
-if (!process.env.STRIPE_WEBHOOK_SECRET) {
-  console.error("❌ STRIPE_WEBHOOK_SECRET missing.");
-  process.exit(1);
-}
-
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 /*
@@ -131,58 +118,6 @@ app.get("/", (req, res) => {
 
 /*
 ====================================
-CREATE CHECKOUT SESSION
-====================================
-*/
-
-app.post("/create-checkout-session", async (req, res) => {
-  try {
-    const { phone } = req.body;
-    const formattedPhone = normalizePhone(phone);
-
-    const user = await pool.query(
-      `SELECT verified FROM users WHERE phone = $1`,
-      [formattedPhone]
-    );
-
-    if (!user.rows.length || !user.rows[0].verified) {
-      return res.status(400).json({ error: "User must be verified first." });
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price: process.env.STRIPE_PRICE_ID,
-          quantity: 1,
-        },
-      ],
-      success_url: "https://example.com/success",
-      cancel_url: "https://example.com/cancel",
-      metadata: {
-        phone: formattedPhone,
-      },
-    });
-
-    const client = getTwilioClient();
-
-    await client.messages.create({
-      body: `Complete your Quinn activation here: ${session.url}`,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: formattedPhone,
-    });
-
-    res.json({ status: "checkout_link_sent" });
-
-  } catch (err) {
-    console.error("Checkout error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-/*
-====================================
 STRIPE WEBHOOK
 ====================================
 */
@@ -203,9 +138,14 @@ app.post("/stripe-webhook", async (req, res) => {
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
-    const phone = session.metadata.phone;
+    const phone = session.metadata?.phone;
 
     console.log("🔥 Checkout completed for:", phone);
+
+    if (!phone) {
+      console.error("❌ No phone in metadata");
+      return res.json({ received: true });
+    }
 
     try {
       const client = getTwilioClient();
@@ -227,25 +167,51 @@ app.post("/stripe-webhook", async (req, res) => {
       const expiration = new Date();
       expiration.setDate(expiration.getDate() + 30);
 
-      await pool.query(`
-        UPDATE users
-        SET role = 'subscriber',
-            status = 'active',
-            stripe_customer_id = $1,
-            stripe_subscription_id = $2,
-            proxy_number = $3,
-            proxy_sid = $4,
-            subscription_expires_at = $5,
-            last_seen = NOW()
-        WHERE phone = $6
-      `, [
-        session.customer,
-        session.subscription,
-        purchased.phoneNumber,
-        purchased.sid,
-        expiration,
-        phone,
-      ]);
+      /*
+      ====================================
+      SAFE COLUMN DETECTION
+      ====================================
+      */
+
+      const columnCheck = await pool.query(`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'users'
+      `);
+
+      const columns = columnCheck.rows.map(r => r.column_name);
+
+      const updates = [];
+      const values = [];
+      let i = 1;
+
+      function addIfExists(column, value) {
+        if (columns.includes(column)) {
+          updates.push(`${column} = $${i}`);
+          values.push(value);
+          i++;
+        }
+      }
+
+      addIfExists("role", "subscriber");
+      addIfExists("status", "active");
+      addIfExists("stripe_customer_id", session.customer);
+      addIfExists("stripe_subscription_id", session.subscription);
+      addIfExists("proxy_number", purchased.phoneNumber);
+      addIfExists("proxy_sid", purchased.sid);
+      addIfExists("subscription_expires_at", expiration);
+      addIfExists("last_seen", new Date());
+
+      if (updates.length > 0) {
+        const sql = `
+          UPDATE users
+          SET ${updates.join(", ")}
+          WHERE phone = $${i}
+        `;
+        values.push(phone);
+
+        await pool.query(sql, values);
+      }
 
       await client.messages.create({
         body: `✅ Quinn Activated
