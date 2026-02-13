@@ -62,7 +62,7 @@ async function initializeDatabase() {
       );
     `);
 
-    console.log("✅ Users table ready (Sprint 4 schema).");
+    console.log("✅ Users table ready.");
   } catch (err) {
     console.error("❌ DB init error:", err);
     process.exit(1);
@@ -127,19 +127,142 @@ ROOT
 */
 
 app.get("/", (req, res) => {
-  res.status(200).send("Quinn backend running – Sprint 4 Auto Provisioning.");
+  res.status(200).send("Quinn backend running.");
 });
 
 /*
 ====================================
-PROXY FORWARD ENDPOINT
+START VERIFICATION
+====================================
+*/
+
+app.post("/start-verification", async (req, res) => {
+  try {
+    const { name, phone } = req.body;
+    const formattedPhone = normalizePhone(phone);
+
+    const client = getTwilioClient();
+
+    await pool.query(`
+      INSERT INTO users (name, phone, status, verified)
+      VALUES ($1, $2, 'pending_verification', false)
+      ON CONFLICT (phone)
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        status = 'pending_verification',
+        verified = false;
+    `, [name || null, formattedPhone]);
+
+    await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verifications.create({
+        to: formattedPhone,
+        channel: "sms"
+      });
+
+    res.json({ status: "verification_started" });
+
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/*
+====================================
+VERIFY OTP
+====================================
+*/
+
+app.post("/verify", async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    const formattedPhone = normalizePhone(phone);
+    const client = getTwilioClient();
+
+    const check = await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verificationChecks.create({
+        to: formattedPhone,
+        code
+      });
+
+    if (check.status === "approved") {
+      await pool.query(`
+        UPDATE users
+        SET verified = true,
+            verified_at = NOW(),
+            status = 'verified',
+            last_seen = NOW()
+        WHERE phone = $1
+      `, [formattedPhone]);
+
+      return res.json({ status: "approved" });
+    }
+
+    res.status(400).json({ error: "Invalid code" });
+
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/*
+====================================
+CREATE CHECKOUT SESSION
+====================================
+*/
+
+app.post("/create-checkout-session", async (req, res) => {
+  try {
+    const { phone } = req.body;
+    const formattedPhone = normalizePhone(phone);
+
+    const user = await pool.query(
+      `SELECT verified FROM users WHERE phone = $1`,
+      [formattedPhone]
+    );
+
+    if (!user.rows.length || !user.rows[0].verified) {
+      return res.status(400).json({ error: "User must be verified first." });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      line_items: [{
+        price: process.env.STRIPE_PRICE_ID,
+        quantity: 1
+      }],
+      success_url: "https://example.com/success",
+      cancel_url: "https://example.com/cancel",
+      metadata: {
+        phone: formattedPhone
+      }
+    });
+
+    const client = getTwilioClient();
+
+    await client.messages.create({
+      body: `Complete your Quinn activation here: ${session.url}`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: formattedPhone
+    });
+
+    res.json({ status: "checkout_link_sent" });
+
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/*
+====================================
+PROXY FORWARD
 ====================================
 */
 
 app.post("/proxy-forward", async (req, res) => {
   try {
     const proxyNumber = req.body.To;
-    const caller = req.body.From;
 
     const user = await pool.query(
       `SELECT phone, forwarding_enabled, subscription_expires_at
@@ -147,47 +270,34 @@ app.post("/proxy-forward", async (req, res) => {
       [proxyNumber]
     );
 
-    if (user.rows.length === 0) {
-      return res.type("text/xml").send(`
-        <Response>
-          <Say>This number is not active.</Say>
-        </Response>
-      `);
+    if (!user.rows.length) {
+      return res.type("text/xml").send(`<Response><Say>This number is not active.</Say></Response>`);
     }
 
     const record = user.rows[0];
 
     if (!record.forwarding_enabled) {
-      return res.type("text/xml").send(`
-        <Response>
-          <Say>Forwarding is currently disabled.</Say>
-        </Response>
-      `);
+      return res.type("text/xml").send(`<Response><Say>Forwarding disabled.</Say></Response>`);
     }
 
     if (new Date(record.subscription_expires_at) < new Date()) {
-      return res.type("text/xml").send(`
-        <Response>
-          <Say>Your protection has expired.</Say>
-        </Response>
-      `);
+      return res.type("text/xml").send(`<Response><Say>Subscription expired.</Say></Response>`);
     }
 
-    return res.type("text/xml").send(`
+    res.type("text/xml").send(`
       <Response>
         <Dial>${record.phone}</Dial>
       </Response>
     `);
 
   } catch (err) {
-    console.error("❌ proxy-forward error:", err);
-    res.type("text/xml").send("<Response><Say>Error.</Say></Response>");
+    res.type("text/xml").send(`<Response><Say>Error.</Say></Response>`);
   }
 });
 
 /*
 ====================================
-STRIPE WEBHOOK
+STRIPE WEBHOOK (AUTO PROVISIONING)
 ====================================
 */
 
@@ -201,7 +311,6 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error("❌ Stripe signature failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
@@ -212,17 +321,12 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
     try {
       const client = getTwilioClient();
 
-      // 1️⃣ Purchase new number
-      const availableNumbers = await client.availablePhoneNumbers("US")
+      const available = await client.availablePhoneNumbers("US")
         .local
         .list({ limit: 1 });
 
-      if (availableNumbers.length === 0) {
-        throw new Error("No available numbers.");
-      }
-
       const purchased = await client.incomingPhoneNumbers.create({
-        phoneNumber: availableNumbers[0].phoneNumber,
+        phoneNumber: available[0].phoneNumber,
         voiceUrl: process.env.PROXY_VOICE_WEBHOOK_URL,
         voiceMethod: "POST"
       });
@@ -230,7 +334,6 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
       const expiration = new Date();
       expiration.setDate(expiration.getDate() + 30);
 
-      // 2️⃣ Update DB
       await pool.query(`
         UPDATE users
         SET role = 'subscriber',
@@ -251,9 +354,8 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
         phone
       ]);
 
-      // 3️⃣ Send confirmation SMS
       await client.messages.create({
-        body: `✅ Quinn AirGap Activated.\n\nYour private number:\n${purchased.phoneNumber}\n\nExpires: ${expiration.toDateString()}`,
+        body: `✅ Quinn Activated\nYour private number: ${purchased.phoneNumber}\nExpires: ${expiration.toDateString()}`,
         from: process.env.TWILIO_PHONE_NUMBER,
         to: phone
       });
@@ -261,7 +363,7 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
       console.log("🚀 AirGap provisioned for:", phone);
 
     } catch (err) {
-      console.error("❌ Provisioning failed:", err);
+      console.error("Provisioning failed:", err);
     }
   }
 
