@@ -138,17 +138,24 @@ app.post("/stripe-webhook", async (req, res) => {
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
-    const phone = session.metadata?.phone;
+    const rawPhone = session.metadata?.phone;
 
-    console.log("🔥 Checkout completed for:", phone);
+    console.log("🔥 Checkout completed. Metadata phone:", rawPhone);
 
-    if (!phone) {
+    if (!rawPhone) {
       console.error("❌ No phone in metadata");
       return res.json({ received: true });
     }
 
     try {
+      const phone = normalizePhone(rawPhone);
       const client = getTwilioClient();
+
+      /*
+      ====================================
+      PURCHASE NEW LOCAL NUMBER
+      ====================================
+      */
 
       const available = await client.availablePhoneNumbers("US")
         .local
@@ -164,54 +171,53 @@ app.post("/stripe-webhook", async (req, res) => {
         voiceMethod: "POST",
       });
 
-      const expiration = new Date();
-      expiration.setDate(expiration.getDate() + 30);
+      console.log("📞 Purchased:", purchased.phoneNumber);
 
       /*
       ====================================
-      SAFE COLUMN DETECTION
+      UPDATE DATABASE
       ====================================
       */
 
-      const columnCheck = await pool.query(`
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = 'users'
-      `);
+      const expiration = new Date();
+      expiration.setDate(expiration.getDate() + 30);
 
-      const columns = columnCheck.rows.map(r => r.column_name);
+      const result = await pool.query(
+        `
+        UPDATE users
+        SET
+          role = 'subscriber',
+          status = 'active',
+          stripe_customer_id = $1,
+          stripe_subscription_id = $2,
+          proxy_number = $3,
+          proxy_sid = $4,
+          subscription_expires_at = $5,
+          last_seen = NOW()
+        WHERE phone = $6
+        RETURNING id
+        `,
+        [
+          session.customer,
+          session.subscription,
+          purchased.phoneNumber,
+          purchased.sid,
+          expiration,
+          phone
+        ]
+      );
 
-      const updates = [];
-      const values = [];
-      let i = 1;
-
-      function addIfExists(column, value) {
-        if (columns.includes(column)) {
-          updates.push(`${column} = $${i}`);
-          values.push(value);
-          i++;
-        }
+      if (result.rowCount === 0) {
+        throw new Error("User not found in DB for phone: " + phone);
       }
 
-      addIfExists("role", "subscriber");
-      addIfExists("status", "active");
-      addIfExists("stripe_customer_id", session.customer);
-      addIfExists("stripe_subscription_id", session.subscription);
-      addIfExists("proxy_number", purchased.phoneNumber);
-      addIfExists("proxy_sid", purchased.sid);
-      addIfExists("subscription_expires_at", expiration);
-      addIfExists("last_seen", new Date());
+      console.log("✅ DB updated for:", phone);
 
-      if (updates.length > 0) {
-        const sql = `
-          UPDATE users
-          SET ${updates.join(", ")}
-          WHERE phone = $${i}
-        `;
-        values.push(phone);
-
-        await pool.query(sql, values);
-      }
+      /*
+      ====================================
+      SEND ACTIVATION SMS
+      ====================================
+      */
 
       await client.messages.create({
         body: `✅ Quinn Activated
@@ -221,10 +227,10 @@ Expires: ${expiration.toDateString()}`,
         to: phone,
       });
 
-      console.log("🚀 Provisioned for:", phone);
+      console.log("🚀 Provisioned successfully for:", phone);
 
     } catch (err) {
-      console.error("Provisioning failed:", err);
+      console.error("❌ Provisioning failed:", err);
     }
   }
 
